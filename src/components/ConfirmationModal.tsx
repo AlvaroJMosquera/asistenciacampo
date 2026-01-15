@@ -1,3 +1,4 @@
+import { forwardRef } from 'react';
 import { CheckCircle, XCircle, Clock } from 'lucide-react';
 import {
   Dialog,
@@ -17,15 +18,9 @@ interface ConfirmationModalProps {
   error?: string | null;
 }
 
-export function ConfirmationModal({
-  isOpen,
-  onClose,
-  type,
-  success,
-  hoursWorked,
-  error,
-}: ConfirmationModalProps) {
-  const isEntrada = type === 'entrada';
+export const ConfirmationModal = forwardRef<HTMLDivElement, ConfirmationModalProps>(
+  function ConfirmationModal({ isOpen, onClose, type, success, hoursWorked, error }, ref) {
+    const isEntrada = type === 'entrada';
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -81,4 +76,5 @@ export function ConfirmationModal({
       </DialogContent>
     </Dialog>
   );
-}
+  }
+);

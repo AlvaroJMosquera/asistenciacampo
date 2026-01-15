@@ -42,6 +42,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (profileError) {
         console.error('Error fetching profile:', profileError);
+        setIsLoading(false);
         return;
       }
 
@@ -55,12 +56,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (roleError) {
         console.error('Error fetching role:', roleError);
+        setIsLoading(false);
         return;
       }
 
       setRole(roleData.role as AppRole);
+      setIsLoading(false);
     } catch (error) {
       console.error('Error in fetchProfile:', error);
+      setIsLoading(false);
     }
   };
 
@@ -108,7 +112,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setIsLoading(false);
     });
 
-    return () => subscription.unsubscribe();
+    // Safety timeout to prevent infinite loading
+    const timeout = setTimeout(() => {
+      if (isLoading) {
+        console.warn('Auth loading timeout - forcing load complete');
+        setIsLoading(false);
+      }
+    }, 10000);
+
+    return () => {
+      subscription.unsubscribe();
+      clearTimeout(timeout);
+    };
   }, []);
 
   const signIn = async (email: string, password: string) => {
