@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
 import { LogIn, LogOut, User, Leaf, Settings, Camera, MapPin } from 'lucide-react';
@@ -25,10 +25,50 @@ import {
 
 type FollowUpRow = { evidencia_n: 1 | 2; foto_url: string; timestamp: string };
 
+// ✅ pruebas: 1 minuto (cambia a 3*60*60*1000 en prod)
+const FOLLOWUP_REQUIRED_MS = 1 * 60 * 1000;
+
+function storageKey(userId: string, entradaId: string) {
+  return `followups:${userId}:${entradaId}`;
+}
+
+function readLocalFollowups(userId: string, entradaId: string): FollowUpRow[] {
+  try {
+    const raw = localStorage.getItem(storageKey(userId, entradaId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as FollowUpRow[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalFollowups(userId: string, entradaId: string, rows: FollowUpRow[]) {
+  localStorage.setItem(storageKey(userId, entradaId), JSON.stringify(rows));
+}
+
+/**
+ * ✅ Detecta iOS (Safari/Chrome iOS) para ajustar UX si hace falta
+ */
+function isIOS() {
+  if (typeof navigator === 'undefined') return false;
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && (navigator as any).maxTouchPoints > 1);
+}
+
 export default function OperarioHome() {
-  const { profile, isSupervisor, signOut } = useAuth();
-  const { isSubmitting, error, lastRecord, todayRecords, markAttendance, getTodayRecords, calculateHoursWorked, markFollowUp } =
-    useAttendance();
+  const { profile, isSupervisor, signOut, user } = useAuth();
+
+  const {
+    isSubmitting,
+    error,
+    lastRecord,
+    todayRecords,
+    markAttendance,
+    getTodayRecords,
+    calculateHoursWorked,
+    markFollowUp,
+    syncPendingFollowups, // ✅ debe existir en tu hook useAttendance
+  } = useAttendance();
 
   const [modalState, setModalState] = useState<{
     isOpen: boolean;
@@ -38,30 +78,64 @@ export default function OperarioHome() {
     error?: string | null;
   }>({ isOpen: false, type: 'entrada', success: false });
 
-  const { capturePhoto } = useCamera();
+  const { capturePhoto, error: cameraError } = useCamera();
 
-  // Seguimiento: estado
-  const [followups, setFollowups] = useState<FollowUpRow[]>([]);
+  // Seguimiento: estado (remoto + local)
+  const [remoteFollowups, setRemoteFollowups] = useState<FollowUpRow[]>([]);
+  const [localFollowups, setLocalFollowups] = useState<FollowUpRow[]>([]);
   const [isLoadingFollowups, setIsLoadingFollowups] = useState(false);
 
-  // ✅ Geo modal (mejor UX)
+  // ✅ Geo modal
   const [geoOpen, setGeoOpen] = useState(false);
   const [geoInfo, setGeoInfo] = useState<{ nom: string; hac_ste: string } | null>(null);
-  const [geoCoords, setGeoCoords] = useState<{ lat: number | null; lon: number | null; accuracy: number | null } | null>(null);
+  const [geoCoords, setGeoCoords] = useState<{
+    lat: number | null;
+    lon: number | null;
+    accuracy: number | null;
+  } | null>(null);
   const [geoMsg, setGeoMsg] = useState<string | null>(null);
 
+  // ✅ ticker para que el contador se actualice offline
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // ✅ refresca registros al montar
   useEffect(() => {
     getTodayRecords();
   }, [getTodayRecords]);
+
+  // ✅ cuando vuelve internet: sincroniza pendientes (evidencias y registros) y refresca
+  useEffect(() => {
+    const onOnline = async () => {
+      try {
+        await syncPendingFollowups?.();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        await getTodayRecords();
+        await loadFollowups();
+      }
+    };
+
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncPendingFollowups, getTodayRecords]);
 
   const today = format(new Date(), "EEEE, d 'de' MMMM", { locale: es });
   const hoursWorked = calculateHoursWorked();
 
   const closeModal = () => setModalState((prev) => ({ ...prev, isOpen: false }));
 
-  // ✅ Determinar “entrada activa”
+  // ✅ “entrada activa”
   const activeEntrada = useMemo(() => {
-    const sorted = [...todayRecords].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    const sorted = [...todayRecords].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
     let currentEntrada: any = null;
     for (const r of sorted) {
       if (r.tipo_registro === 'entrada') currentEntrada = r;
@@ -70,12 +144,23 @@ export default function OperarioHome() {
     return currentEntrada;
   }, [todayRecords]);
 
-  // Traer seguimientos desde Supabase para la entrada activa
-  const loadFollowups = async () => {
-    if (!activeEntrada?.id) {
-      setFollowups([]);
+  // ✅ carga de followups: remoto (si hay red) + local (siempre)
+  const loadFollowups = useCallback(async () => {
+    if (!activeEntrada?.id || !user?.id) {
+      setRemoteFollowups([]);
+      setLocalFollowups([]);
       return;
     }
+
+    // Local siempre (offline-friendly)
+    setLocalFollowups(readLocalFollowups(user.id, activeEntrada.id));
+
+    // Remoto solo si hay red
+    if (!navigator.onLine) {
+      setRemoteFollowups([]);
+      return;
+    }
+
     setIsLoadingFollowups(true);
     const { data, error } = await supabase
       .from('seguimiento_fotos')
@@ -83,50 +168,77 @@ export default function OperarioHome() {
       .eq('entrada_id', activeEntrada.id)
       .order('evidencia_n', { ascending: true });
 
-    if (!error) setFollowups((data || []) as FollowUpRow[]);
+    if (!error) setRemoteFollowups((data || []) as FollowUpRow[]);
     setIsLoadingFollowups(false);
-  };
+  }, [activeEntrada?.id, user?.id]);
 
   useEffect(() => {
     loadFollowups();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeEntrada?.id]);
+  }, [loadFollowups]);
+
+  // ✅ Unificar: remoto + local (local pisa para habilitar offline)
+  const followups = useMemo(() => {
+    const map = new Map<string, FollowUpRow>();
+
+    // remoto
+    for (const f of remoteFollowups) map.set(`${f.evidencia_n}`, f);
+
+    // local pisa si existe
+    for (const f of localFollowups) map.set(`${f.evidencia_n}`, f);
+
+    return Array.from(map.values()).sort((a, b) => a.evidencia_n - b.evidencia_n);
+  }, [remoteFollowups, localFollowups]);
 
   const hasFollow1 = followups.some((f) => f.evidencia_n === 1);
   const hasFollow2 = followups.some((f) => f.evidencia_n === 2);
 
-  // ✅ Regla de 3 horas para Registro 1
+  // ✅ Regla de habilitación Registro 1 (offline): depende SOLO del timestamp de la entrada
   const follow1EnabledInfo = useMemo(() => {
+    void tick;
+
     if (!activeEntrada) return { enabled: false, remainingText: 'Primero marca entrada' };
 
     const start = new Date(activeEntrada.timestamp).getTime();
     const now = Date.now();
     const diffMs = now - start;
-    const requiredMs = 0.01 * 60 * 60 * 1000;
 
-    if (diffMs >= requiredMs) return { enabled: true, remainingText: '' };
+    if (diffMs >= FOLLOWUP_REQUIRED_MS) return { enabled: true, remainingText: '' };
 
-    const remaining = requiredMs - diffMs;
-    const hrs = Math.floor(remaining / (60 * 60 * 1000));
-    const mins = Math.ceil((remaining % (60 * 60 * 1000)) / (60 * 1000));
-    return { enabled: false, remainingText: `Disponible en ${hrs}h ${mins}m` };
-  }, [activeEntrada]);
+    const remaining = FOLLOWUP_REQUIRED_MS - diffMs;
+    const mins = Math.floor(remaining / (60 * 1000));
+    const secs = Math.max(0, Math.ceil((remaining % (60 * 1000)) / 1000));
+
+    return { enabled: false, remainingText: ` ${mins}m ${secs}s` };
+  }, [activeEntrada, tick]);
+
+  /**
+   * ✅ helper: abre modal de error con mensaje útil (iPhone/Android sin consola)
+   */
+  const showError = useCallback(
+    (type: 'entrada' | 'salida', message: string) => {
+      setModalState({
+        isOpen: true,
+        type,
+        success: false,
+        hoursWorked: null,
+        error: message,
+      });
+    },
+    []
+  );
 
   const handleMarkAttendance = async (tipo: 'entrada' | 'salida') => {
     try {
-      // 🔒 No permitir salida si no existe Registro 1
+      // 🔒 Salida requiere Registro 1 (funciona offline por localStorage)
       if (tipo === 'salida' && !hasFollow1) {
-        setModalState({
-          isOpen: true,
-          type: 'salida',
-          success: false,
-          hoursWorked: null,
-          error: 'Debes completar el Registro 1 de seguimiento antes de marcar la salida.',
-        });
+        showError('salida', 'Debes completar el Registro 1 de seguimiento antes de marcar la salida.');
         return;
       }
 
+      // ✅ Captura foto (input file) -> estable en iPhone/Android
       const photoBlob = await capturePhoto();
+
+      // ✅ Marca asistencia (sube a storage si online, o guarda pending si offline)
       const result = await markAttendance(tipo, photoBlob);
 
       setModalState({
@@ -134,16 +246,16 @@ export default function OperarioHome() {
         type: tipo,
         success: result.success,
         hoursWorked: result.hoursWorked,
-        error: result.success ? null : (result.error ?? error),
+        error: result.success ? null : (result.error ?? error ?? 'No se pudo registrar'),
       });
 
-      if (result.success) {
-        await getTodayRecords();
-        await loadFollowups();
-      }
+      if (!result.success) return;
 
-      // ✅ Mejor UX: mostrar geo modal SOLO en entrada exitosa usando la info ya calculada
-      if (tipo === 'entrada' && result.success) {
+      await getTodayRecords();
+      await loadFollowups();
+
+      // ✅ Geo modal SOLO en entrada exitosa
+      if (tipo === 'entrada') {
         setGeoCoords(result.coords ?? null);
         setGeoInfo(result.geo ?? null);
 
@@ -155,25 +267,75 @@ export default function OperarioHome() {
           setGeoMsg(null);
         }
 
-        setGeoOpen(true);
+        // iOS: a veces conviene abrir modal después de un micro-delay
+        if (isIOS()) setTimeout(() => setGeoOpen(true), 50);
+        else setGeoOpen(true);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+
+      // ✅ Mensaje útil para celular
+      const msg =
+        err?.message ||
+        cameraError ||
+        'Error en móvil. Verifica permisos de Cámara/Ubicación o que Storage tenga permisos para subir fotos.';
+
+      showError(tipo, msg);
     }
   };
 
   const handleFollowUp = async (n: 1 | 2) => {
     try {
-      if (!activeEntrada?.id) return;
+      if (!activeEntrada?.id || !user?.id) {
+        showError('entrada', 'Primero debes marcar la entrada.');
+        return;
+      }
 
       if (n === 1 && !follow1EnabledInfo.enabled) return;
       if (n === 2 && !hasFollow1) return;
 
       const blob = await capturePhoto();
-      await markFollowUp(n, blob, activeEntrada.id);
+
+      // ✅ UX OFFLINE: marcar local primero para habilitar salida incluso offline
+      const localRow: FollowUpRow = {
+        evidencia_n: n,
+        foto_url: 'local://pending',
+        timestamp: new Date().toISOString(),
+      };
+
+      const current = readLocalFollowups(user.id, activeEntrada.id);
+      const next = [...current.filter((x) => x.evidencia_n !== n), localRow].sort(
+        (a, b) => a.evidencia_n - b.evidencia_n
+      );
+      writeLocalFollowups(user.id, activeEntrada.id, next);
+      setLocalFollowups(next);
+
+      // ✅ Guarda remoto si online, si no guarda base64 pendiente (en useAttendance)
+      const res = await markFollowUp(n, blob, activeEntrada.id);
+
+      if (!res?.success) {
+        showError('entrada', 'No se pudo guardar la evidencia. Intenta de nuevo.');
+        return;
+      }
+
+      // ✅ Si hay red, intenta sincronizar pendientes inmediatamente (por flapping)
+      if (navigator.onLine) {
+        try {
+          await syncPendingFollowups?.();
+        } catch (e) {
+          console.error(e);
+          // no bloquea
+        }
+      }
+
       await loadFollowups();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      const msg =
+        err?.message ||
+        cameraError ||
+        'Error registrando evidencia. Revisa permisos de Cámara y almacenamiento.';
+      showError('entrada', msg);
     }
   };
 
@@ -221,19 +383,30 @@ export default function OperarioHome() {
           <LastRecordCard record={lastRecord} />
         </div>
 
-        {/* Seguimiento fotográfico */}
-        <div className="pt-2 space-y-2">
-          <h2 className="text-sm font-medium text-muted-foreground">Seguimiento fotográfico</h2>
+        {/* ✅ Botones en orden UX: Entrada -> Evidencia -> Salida */}
+        <div className="space-y-3 pt-4">
+          <AttendanceButton
+            type="entrada"
+            onClick={() => handleMarkAttendance('entrada')}
+            disabled={isSubmitting || !!activeEntrada}
+          >
+            <LogIn className="h-7 w-7" />
+            <span>{activeEntrada ? 'Entrada ya registrada' : 'Marcar Entrada'}</span>
+          </AttendanceButton>
 
+          {/* ✅ Evidencia obligatoria */}
           <Button
             className="w-full"
             onClick={() => handleFollowUp(1)}
             disabled={isSubmitting || hasFollow1 || !follow1EnabledInfo.enabled || !activeEntrada}
           >
             <Camera className="h-4 w-4 mr-2" />
-            {hasFollow1 ? 'Registro 1 completado' : `Registro 1 (obligatorio) ${follow1EnabledInfo.remainingText}`}
+            {hasFollow1
+              ? 'Registro de evidencia completado ✅'
+              : `Registrar evidencia en ${follow1EnabledInfo.remainingText}`}
           </Button>
 
+          {/* ✅ Evidencia adicional opcional */}
           <Button
             className="w-full"
             variant="outline"
@@ -241,35 +414,33 @@ export default function OperarioHome() {
             disabled={isSubmitting || hasFollow2 || !hasFollow1 || !activeEntrada}
           >
             <Camera className="h-4 w-4 mr-2" />
-            {hasFollow2 ? 'Registro 2 completado' : 'Registro 2 (opcional)'}
+            {hasFollow2 ? 'Evidencia adicional completada ✅' : 'Registrar evidencia adicional'}
           </Button>
 
+          <AttendanceButton
+            type="salida"
+            onClick={() => handleMarkAttendance('salida')}
+            disabled={isSubmitting || !hasFollow1}
+          >
+            <LogOut className="h-7 w-7" />
+            <span>{hasFollow1 ? 'Marcar Salida' : 'Marcar Salida (requiere evidencia)'}</span>
+          </AttendanceButton>
+
           {isLoadingFollowups ? (
-            <p className="text-xs text-muted-foreground">Cargando seguimientos...</p>
+            <p className="text-xs text-muted-foreground">Cargando evidencias...</p>
           ) : (
             <p className="text-xs text-muted-foreground">
-              Registros: {hasFollow1 ? '✅ 1' : '❌ 1'} / {hasFollow2 ? '✅ 2' : '— 2'}
+              Evidencias: {hasFollow1 ? '✅ 1' : '❌ 1'} / {hasFollow2 ? '✅ 2' : '— 2'}
             </p>
           )}
-        </div>
-
-        {/* Botones principales */}
-        <div className="space-y-4 pt-4">
-          <AttendanceButton type="entrada" onClick={() => handleMarkAttendance('entrada')} disabled={isSubmitting || !!activeEntrada}>
-            <LogIn className="h-7 w-7" />
-            <span>{activeEntrada ? 'Entrada ya registrada' : 'Marcar Entrada'}</span>
-          </AttendanceButton>
-
-          <AttendanceButton type="salida" onClick={() => handleMarkAttendance('salida')} disabled={isSubmitting || !hasFollow1}>
-            <LogOut className="h-7 w-7" />
-            <span>{hasFollow1 ? 'Marcar Salida' : 'Marcar Salida (requiere Registro 1)'}</span>
-          </AttendanceButton>
         </div>
 
         {/* Resumen */}
         {todayRecords.length > 0 && (
           <div className="pt-4">
-            <h3 className="text-sm font-medium text-muted-foreground mb-2">Registros de hoy ({todayRecords.length})</h3>
+            <h3 className="text-sm font-medium text-muted-foreground mb-2">
+              Registros de hoy ({todayRecords.length})
+            </h3>
             <div className="space-y-2">
               {todayRecords.slice(0, 4).map((record) => (
                 <div key={record.id} className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
@@ -296,9 +467,7 @@ export default function OperarioHome() {
               <MapPin className="h-5 w-5" />
               Ubicación al iniciar turno
             </DialogTitle>
-            <DialogDescription>
-              Usamos tu ubicación capturada al registrar la entrada (sin pedir GPS dos veces).
-            </DialogDescription>
+            <DialogDescription>Ubicación capturada al registrar la entrada.</DialogDescription>
           </DialogHeader>
 
           {geoInfo ? (

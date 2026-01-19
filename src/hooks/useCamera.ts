@@ -6,6 +6,16 @@ interface CameraState {
   error: string | null;
 }
 
+function isAndroid() {
+  if (typeof navigator === 'undefined') return false;
+  return /Android/i.test(navigator.userAgent);
+}
+
+function isIOS() {
+  if (typeof navigator === 'undefined') return false;
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) || ((navigator as any).maxTouchPoints > 1 && /MacIntel/.test(navigator.platform));
+}
+
 export function useCamera() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [state, setState] = useState<CameraState>({
@@ -15,21 +25,21 @@ export function useCamera() {
 
   const capturePhoto = useCallback((): Promise<Blob> => {
     return new Promise((resolve, reject) => {
-      // Remove existing input if any
+      // Limpia input anterior
       if (inputRef.current) {
-        document.body.removeChild(inputRef.current);
+        try {
+          document.body.removeChild(inputRef.current);
+        } catch {}
         inputRef.current = null;
       }
 
-      // Create fresh input element for each capture
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'image/*';
-      
-      // For iOS Safari, we need to be more specific
-      // Setting capture="user" should open front camera directly
-      input.setAttribute('capture', 'user');
-      
+
+      // ✅ Cámara trasera en campo (mejor)
+      input.setAttribute('capture', 'environment');
+
       input.style.position = 'fixed';
       input.style.top = '-9999px';
       input.style.left = '-9999px';
@@ -39,32 +49,38 @@ export function useCamera() {
 
       setState({ isCapturing: true, error: null });
 
-      let isResolved = false;
+      let done = false;
 
       const cleanup = () => {
-        if (inputRef.current && inputRef.current.parentNode) {
-          document.body.removeChild(inputRef.current);
-        }
+        try {
+          if (inputRef.current?.parentNode) document.body.removeChild(inputRef.current);
+        } catch {}
         inputRef.current = null;
+
+        // OJO: en Android NO usamos visibility/focus (causan falsos cancel)
+        if (!isAndroid()) {
+          document.removeEventListener('visibilitychange', onVis);
+          window.removeEventListener('focus', onFocus);
+        }
+
+        if (cancelTimer) window.clearTimeout(cancelTimer);
       };
 
-      input.onchange = async (e) => {
-        if (isResolved) return;
-        isResolved = true;
+      const finishReject = (msg: string) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        setState({ isCapturing: false, error: msg });
+        reject(new Error(msg));
+      };
 
-        const target = e.target as HTMLInputElement;
-        const file = target.files?.[0];
-
-        if (!file) {
-          cleanup();
-          setState({ isCapturing: false, error: 'No se capturó ninguna foto' });
-          reject(new Error('No se capturó ninguna foto'));
-          return;
-        }
+      const finishResolve = async (file: File) => {
+        if (done) return;
+        done = true;
 
         try {
-          // Compress the image for field use (max 500KB)
-          const compressedFile = await imageCompression(file, {
+          // ✅ Comprimir (campo) - ojo: algunos Android se demoran
+          const compressed = await imageCompression(file, {
             maxSizeMB: 0.5,
             maxWidthOrHeight: 1280,
             useWebWorker: true,
@@ -72,47 +88,58 @@ export function useCamera() {
 
           cleanup();
           setState({ isCapturing: false, error: null });
-          resolve(compressedFile);
-        } catch (error) {
+          resolve(compressed);
+        } catch {
           cleanup();
-          const errorMessage = 'Error procesando la foto';
-          setState({ isCapturing: false, error: errorMessage });
-          reject(new Error(errorMessage));
+          const msg = 'Error procesando la foto';
+          setState({ isCapturing: false, error: msg });
+          reject(new Error(msg));
         }
       };
 
-      // Handle cancel - use a more reliable method for iOS
-      const handleVisibilityChange = () => {
-        // Small delay to allow file selection to complete
-        setTimeout(() => {
-          if (!isResolved && (!input.files || input.files.length === 0)) {
-            isResolved = true;
-            cleanup();
-            setState({ isCapturing: false, error: null });
-            reject(new Error('Captura cancelada'));
-          }
-          document.removeEventListener('visibilitychange', handleVisibilityChange);
-        }, 1000);
+      // ✅ Cancelación estable: solo por timeout largo
+      // (Si el usuario toma foto, onchange llegará y cancelTimer se limpia en cleanup)
+      const cancelMs = isAndroid() ? 45000 : 30000; // Android a veces tarda más
+      const cancelTimer = window.setTimeout(() => {
+        // Si no llegó onchange, asumimos cancelado
+        if (!done) finishReject('Captura cancelada');
+      }, cancelMs);
+
+      input.onchange = () => {
+        const file = input.files?.[0];
+        if (!file) {
+          finishReject('Captura cancelada');
+          return;
+        }
+        void finishResolve(file);
       };
 
-      document.addEventListener('visibilitychange', handleVisibilityChange);
-
-      // Also handle focus for desktop browsers
-      const handleFocus = () => {
+      // ✅ SOLO iOS/desktop: algunos navegadores no disparan onchange si cancelan,
+      // y estos handlers ayudan. En Android causan falsos positivos, por eso se desactivan.
+      const onVis = () => {
+        // iOS: espera bastante antes de asumir cancelación
         setTimeout(() => {
-          if (!isResolved && (!input.files || input.files.length === 0)) {
-            isResolved = true;
-            cleanup();
-            setState({ isCapturing: false, error: null });
-            reject(new Error('Captura cancelada'));
+          if (!done && (!input.files || input.files.length === 0)) {
+            // No rechazamos de inmediato: dejamos que el timeout principal decida.
+            // (Esto evita falsos cancel).
           }
-          window.removeEventListener('focus', handleFocus);
-        }, 500);
+        }, 1500);
       };
 
-      window.addEventListener('focus', handleFocus);
+      const onFocus = () => {
+        setTimeout(() => {
+          if (!done && (!input.files || input.files.length === 0)) {
+            // Igual: no rechazamos aquí, solo dejamos que el timeout maneje.
+          }
+        }, 1200);
+      };
 
-      // Trigger file picker/camera
+      if (!isAndroid()) {
+        document.addEventListener('visibilitychange', onVis);
+        window.addEventListener('focus', onFocus);
+      }
+
+      // Disparar cámara/galería
       input.click();
     });
   }, []);

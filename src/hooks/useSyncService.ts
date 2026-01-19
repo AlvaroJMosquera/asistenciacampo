@@ -19,6 +19,7 @@ interface SyncState {
 export function useSyncService() {
   const { isOnline } = useOnlineStatus();
   const { user } = useAuth();
+
   const [state, setState] = useState<SyncState>({
     pendingCount: 0,
     isSyncing: false,
@@ -32,7 +33,7 @@ export function useSyncService() {
   }, []);
 
   const uploadPhoto = async (record: PendingRecord): Promise<string | null> => {
-    if (!record.foto_blob || !user) return record.foto_url;
+    if (!record.foto_blob || !user) return record.foto_url ?? null;
 
     const fileName = `${user.id}/${record.id}.jpg`;
     const { data, error } = await supabase.storage
@@ -47,19 +48,60 @@ export function useSyncService() {
       return null;
     }
 
-    const { data: urlData } = supabase.storage
-      .from('attendance-photos')
-      .getPublicUrl(data.path);
+    const { data: urlData } = supabase.storage.from('attendance-photos').getPublicUrl(data.path);
+    return urlData.publicUrl ?? null;
+  };
 
-    return urlData.publicUrl;
+  /**
+   * ✅ Si el registro NO trae hac_ste/suerte_nom (porque se marcó offline),
+   * y sí trae lat/lon, aquí (ya online) resolvemos con RPC antes de insertar.
+   */
+  const resolveGeoIfMissing = async (record: PendingRecord): Promise<{
+    hac_ste: string | null;
+    suerte_nom: string | null;
+  }> => {
+    const hac_ste = (record as any).hac_ste ?? null;
+    const suerte_nom = (record as any).suerte_nom ?? null;
+
+    // ya viene completo
+    if (hac_ste || suerte_nom) {
+      return { hac_ste, suerte_nom };
+    }
+
+    // no hay coords
+    if (record.latitud == null || record.longitud == null) {
+      return { hac_ste: null, suerte_nom: null };
+    }
+
+    try {
+      const { data, error } = await supabase.rpc('get_hacienda_by_point', {
+        lat: record.latitud,
+        lon: record.longitud,
+      });
+
+      if (error || !data || data.length === 0) {
+        return { hac_ste: null, suerte_nom: null };
+      }
+
+      return {
+        hac_ste: data[0].hac_ste ?? null,
+        suerte_nom: data[0].nom ?? null,
+      };
+    } catch (e) {
+      console.error('resolveGeoIfMissing error:', e);
+      return { hac_ste: null, suerte_nom: null };
+    }
   };
 
   const syncRecord = async (record: PendingRecord): Promise<boolean> => {
     try {
-      // Upload photo first if exists
+      // 1) Subir foto
       const fotoUrl = await uploadPhoto(record);
 
-      // Insert record to database
+      // 2) Resolver geo si falta (ya online)
+      const geo = await resolveGeoIfMissing(record);
+
+      // 3) Insertar en DB (incluye ubicacion)
       const { error } = await supabase.from('registros_asistencia').insert({
         id: record.id,
         user_id: record.user_id,
@@ -74,12 +116,16 @@ export function useSyncService() {
         estado_sync: 'sincronizado',
         es_inconsistente: record.es_inconsistente,
         nota_inconsistencia: record.nota_inconsistencia,
+
+        // ✅ NUEVO: ubicación persistida para CSV supervisor
+        hac_ste: geo.hac_ste,
+        suerte_nom: geo.suerte_nom,
       });
 
       if (error) {
-        // Check if it's a duplicate error (already synced)
+        // Duplicate = ya estaba sincronizado
+        // @ts-ignore
         if (error.code === '23505') {
-          // Delete from pending since it already exists
           await deletePendingRecord(record.id);
           return true;
         }
@@ -87,7 +133,7 @@ export function useSyncService() {
         return false;
       }
 
-      // Remove from pending records
+      // 4) Eliminar de pendientes
       await deletePendingRecord(record.id);
       return true;
     } catch (error) {
@@ -103,16 +149,14 @@ export function useSyncService() {
 
     try {
       const pendingRecords = await getPendingRecords();
+
       let successCount = 0;
       let failCount = 0;
 
       for (const record of pendingRecords) {
         const success = await syncRecord(record);
-        if (success) {
-          successCount++;
-        } else {
-          failCount++;
-        }
+        if (success) successCount++;
+        else failCount++;
       }
 
       await updatePendingCount();
@@ -135,19 +179,19 @@ export function useSyncService() {
     }
   }, [isOnline, user, updatePendingCount]);
 
-  // Auto-sync when coming back online
+  // Auto-sync cuando vuelve internet
   useEffect(() => {
     if (isOnline && user) {
       syncAll();
     }
   }, [isOnline, user, syncAll]);
 
-  // Update pending count on mount and when user changes
+  // actualizar contador al montar y cuando cambia usuario
   useEffect(() => {
     updatePendingCount();
   }, [user, updatePendingCount]);
 
-  // Periodic sync every 30 seconds when online
+  // sync periódico cada 30s cuando hay internet
   useEffect(() => {
     if (!isOnline || !user) return;
 
