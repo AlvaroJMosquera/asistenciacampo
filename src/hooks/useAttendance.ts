@@ -28,6 +28,16 @@ interface AttendanceState {
   todayRecords: AttendanceRecord[];
 }
 
+type GeoResult = { nom: string; hac_ste: string } | null;
+
+type MarkAttendanceResult = {
+  success: boolean;
+  hoursWorked?: number | null;
+  coords?: { lat: number | null; lon: number | null; accuracy: number | null };
+  geo?: GeoResult;
+  error?: string | null;
+};
+
 export function useAttendance() {
   const { user } = useAuth();
   const { getCurrentPosition } = useGeolocation();
@@ -130,16 +140,35 @@ export function useAttendance() {
     return urlData.publicUrl ?? null;
   }, []);
 
+  // ✅ Resolver Hacienda/Suerte con el MISMO GPS capturado en markAttendance
+  const resolveGeo = useCallback(async (lat: number, lon: number): Promise<GeoResult> => {
+    const { data, error } = await supabase.rpc('get_hacienda_by_point', { lat, lon });
+
+    if (error) {
+      console.warn('Geo RPC error:', error);
+      return null;
+    }
+
+    if (!data || data.length === 0) return null;
+
+    return { nom: data[0].nom, hac_ste: data[0].hac_ste };
+  }, []);
+
   /**
    * ✅ Marca Entrada o Salida (solo 1 foto por registro)
    * - Entrada: foto obligatoria
    * - Salida: foto obligatoria
+   *
+   * ✅ Mejor UX:
+   * - Captura GPS una sola vez
+   * - En Entrada, consulta PostGIS con ese GPS y retorna geo (nom/hac_ste)
    */
   const markAttendance = useCallback(
-    async (tipo: 'entrada' | 'salida', photoBlob: Blob): Promise<{ success: boolean; hoursWorked?: number | null }> => {
+    async (tipo: 'entrada' | 'salida', photoBlob: Blob): Promise<MarkAttendanceResult> => {
       if (!user) {
-        setState((prev) => ({ ...prev, error: 'Usuario no autenticado' }));
-        return { success: false };
+        const msg = 'Usuario no autenticado';
+        setState((prev) => ({ ...prev, error: msg }));
+        return { success: false, error: msg };
       }
 
       setState((prev) => ({ ...prev, isSubmitting: true, error: null }));
@@ -151,6 +180,7 @@ export function useAttendance() {
           location = await getCurrentPosition();
         } catch (err) {
           console.warn('Could not get GPS:', err);
+          // seguimos sin GPS
         }
 
         // 2) Inconsistencias
@@ -177,6 +207,8 @@ export function useAttendance() {
           created_at: now.toISOString(),
         };
 
+        let geo: GeoResult = null;
+
         if (isOnline) {
           // Subir foto principal
           const mainPath = `${user.id}/${recordId}.jpg`;
@@ -200,9 +232,15 @@ export function useAttendance() {
           });
 
           if (insertError) throw new Error('Error guardando registro');
+
+          // ✅ Solo en ENTRADA: resolver geo si hay GPS
+          if (tipo === 'entrada' && location?.latitude != null && location?.longitude != null) {
+            geo = await resolveGeo(location.latitude, location.longitude);
+          }
         } else {
           // OFFLINE
           await savePendingRecord(record);
+          // sin internet no resolvemos geo
         }
 
         await getTodayRecords();
@@ -211,26 +249,36 @@ export function useAttendance() {
         if (tipo === 'salida') hoursWorked = calculateHoursWorked();
 
         setState((prev) => ({ ...prev, isSubmitting: false, error: null }));
-        return { success: true, hoursWorked };
+
+        return {
+          success: true,
+          hoursWorked,
+          coords: {
+            lat: location?.latitude ?? null,
+            lon: location?.longitude ?? null,
+            accuracy: location?.accuracy ?? null,
+          },
+          geo,
+          error: null,
+        };
       } catch (err) {
         console.error('Error marking attendance:', err);
+        const msg = 'Error al registrar. Intenta de nuevo.';
         setState((prev) => ({
           ...prev,
           isSubmitting: false,
-          error: 'Error al registrar. Intenta de nuevo.',
+          error: msg,
         }));
-        return { success: false };
+        return { success: false, error: msg };
       }
     },
-    [user, isOnline, getCurrentPosition, checkForInconsistency, getTodayRecords, calculateHoursWorked, uploadPhoto]
+    [user, isOnline, getCurrentPosition, checkForInconsistency, getTodayRecords, calculateHoursWorked, uploadPhoto, resolveGeo]
   );
 
   /**
    * ✅ Seguimiento fotográfico:
    * - evidencia_n = 1 (obligatorio, controlado por UI con 3h)
    * - evidencia_n = 2 (opcional, habilitado luego de completar el 1)
-   *
-   * Requiere tabla: public.seguimiento_fotos (SQL que ya te pasé)
    */
   const markFollowUp = useCallback(
     async (evidenciaN: 1 | 2, photoBlob: Blob, entradaId: string): Promise<{ success: boolean }> => {
@@ -279,7 +327,7 @@ export function useAttendance() {
   return {
     ...state,
     markAttendance,
-    markFollowUp, // 👈 exporta esta función
+    markFollowUp,
     getTodayRecords,
     calculateHoursWorked,
   };
