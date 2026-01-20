@@ -1,9 +1,10 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from './useAuth';
 import { useGeolocation } from './useGeolocation';
 import { useOnlineStatus } from './useOnlineStatus';
 import { savePendingRecord, PendingRecord, getPendingRecords } from '@/lib/offline-db';
+import { getPendingRecordsByUserAndDate } from '@/lib/offline-db';
 
 interface AttendanceRecord {
   id: string;
@@ -20,9 +21,9 @@ interface AttendanceRecord {
   es_inconsistente: boolean;
   nota_inconsistencia: string | null;
 
-  // ✅ NUEVO: para supervisor/CSV
-  hac_ste?: string | null;     // Hacienda-Suerte
-  suerte_nom?: string | null;  // Nombre de la suerte
+  // ✅ para supervisor/CSV
+  hac_ste?: string | null; // Hacienda-Suerte
+  suerte_nom?: string | null; // Nombre de la suerte
 }
 
 interface AttendanceState {
@@ -125,38 +126,37 @@ export function useAttendance() {
    * ✅ Retorna merged para evitar "stale state" en validaciones.
    */
   const getTodayRecords = useCallback(async (): Promise<AttendanceRecord[]> => {
-    if (!user) return [];
+  if (!user) return [];
 
-    const today = toIsoDate();
+  const today = toIsoDate();
 
-    // 1) Pending offline (IndexedDB)
-    const pendingAll = await getPendingRecords();
-    const pendingToday = pendingAll
-      .filter((r) => r.user_id === user.id && r.fecha === today)
-      .map<AttendanceRecord>((r) => ({
-        id: r.id,
-        user_id: r.user_id,
-        fecha: r.fecha,
-        tipo_registro: r.tipo_registro,
-        timestamp: r.timestamp,
-        latitud: r.latitud ?? null,
-        longitud: r.longitud ?? null,
-        precision_gps: r.precision_gps ?? null,
-        fuera_zona: r.fuera_zona ?? false,
-        foto_url: r.foto_url ?? null,
-        estado_sync: 'pendiente',
-        es_inconsistente: r.es_inconsistente ?? false,
-        nota_inconsistencia: r.nota_inconsistencia ?? null,
+  // ✅ 1) Pending offline (IndexedDB) - directo por user+fecha
+  const pendingTodayRaw = await getPendingRecordsByUserAndDate(user.id, today);
 
-        // ✅ si en tu IndexedDB aún no guardas esto, quedará null
-        hac_ste: (r as any).hac_ste ?? null,
-        suerte_nom: (r as any).suerte_nom ?? null,
-      }));
+  const pendingToday = pendingTodayRaw.map<AttendanceRecord>((r) => ({
+    id: r.id,
+    user_id: r.user_id,
+    fecha: r.fecha,
+    tipo_registro: r.tipo_registro,
+    timestamp: r.timestamp,
+    latitud: r.latitud ?? null,
+    longitud: r.longitud ?? null,
+    precision_gps: r.precision_gps ?? null,
+    fuera_zona: r.fuera_zona ?? false,
+    foto_url: r.foto_url ?? null,
+    estado_sync: 'pendiente',
+    es_inconsistente: r.es_inconsistente ?? false,
+    nota_inconsistencia: r.nota_inconsistencia ?? null,
+
+    // ✅ ubicación guardada en IndexedDB
+    hac_ste: (r as any).hac_ste ?? null,
+    suerte_nom: (r as any).suerte_nom ?? null,
+  }));
+
 
     // 2) Supabase (solo si online)
     let remote: AttendanceRecord[] = [];
     if (isOnline) {
-      // ✅ trae campos nuevos si existen
       const { data, error } = await supabase
         .from('registros_asistencia')
         .select('*')
@@ -216,31 +216,55 @@ export function useAttendance() {
   );
 
   /**
-   * ✅ Horas trabajadas (mejor precisión): 2 decimales
-   * - 3 minutos = 0.05h (antes podía redondear a 0.0)
+   * ✅ Horas trabajadas:
+   * - Suma intervalos Entrada->Salida (por parejas) a lo largo del día.
+   * - No hace (primera entrada vs última salida).
+   * - includeOpenSession=true: si hay entrada abierta, suma hasta "ahora".
+   * - 2 decimales (3 min = 0.05h)
    */
-  const calculateHoursWorked = useCallback((): number | null => {
-    const { todayRecords } = state;
-    if (todayRecords.length < 2) return null;
+  const calculateHoursWorked = useCallback(
+    (options?: { includeOpenSession?: boolean }): number | null => {
+      const includeOpenSession = options?.includeOpenSession ?? false;
 
-    const entradas = todayRecords.filter((r) => r.tipo_registro === 'entrada');
-    const salidas = todayRecords.filter((r) => r.tipo_registro === 'salida');
+      // usamos records en orden ascendente para parear entradas y salidas
+      const records = [...state.todayRecords].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
 
-    if (entradas.length === 0 || salidas.length === 0) return null;
+      if (records.length === 0) return null;
 
-    // entrada más vieja (inicio) y salida más reciente
-    const firstEntrada = entradas[entradas.length - 1];
-    const lastSalida = salidas[0];
+      let openStart: number | null = null;
+      let totalMs = 0;
 
-    const start = new Date(firstEntrada.timestamp).getTime();
-    const end = new Date(lastSalida.timestamp).getTime();
+      for (const r of records) {
+        const t = new Date(r.timestamp).getTime();
 
-    const diffMs = end - start;
-    if (diffMs <= 0) return null;
+        if (r.tipo_registro === 'entrada') {
+          // si ya hay una sesión abierta, asumimos que la nueva entrada reemplaza la anterior (entrada-entrada)
+          openStart = t;
+        } else {
+          // salida
+          if (openStart != null) {
+            const diff = t - openStart;
+            if (diff > 0) totalMs += diff;
+            openStart = null;
+          }
+          // salida sin entrada previa => se ignora
+        }
+      }
 
-    const diffHours = diffMs / (1000 * 60 * 60);
-    return Math.round(diffHours * 100) / 100; // ✅ 2 decimales
-  }, [state]);
+      if (includeOpenSession && openStart != null) {
+        const diff = Date.now() - openStart;
+        if (diff > 0) totalMs += diff;
+      }
+
+      if (totalMs <= 0) return null;
+
+      const hours = totalMs / (1000 * 60 * 60);
+      return Math.round(hours * 100) / 100;
+    },
+    [state.todayRecords]
+  );
 
   /**
    * ✅ Subir foto a Storage
@@ -261,6 +285,9 @@ export function useAttendance() {
     return urlData.publicUrl;
   }, []);
 
+  /**
+   * ✅ RPC que devuelve la suerte/ubicación según punto.
+   */
   const resolveGeo = useCallback(async (lat: number, lon: number): Promise<GeoResult> => {
     const { data, error } = await supabase.rpc('get_hacienda_by_point', { lat, lon });
     if (error) return null;
@@ -270,9 +297,9 @@ export function useAttendance() {
 
   /**
    * ✅ Marca entrada/salida (offline ok)
-   * ✅ NUEVO: cuando sea entrada y tengas geo, lo guarda en registros_asistencia:
-   *   - hac_ste
-   *   - suerte_nom
+   * - Calcula ubicación (geo) para ENTRADA y SALIDA si está ONLINE y hay coords.
+   * - Guarda ubicación en BD (hac_ste/suerte_nom) SIEMPRE.
+   * - OFFLINE: guarda en IndexedDB. La geo puede quedar null (se completa al sync).
    */
   const markAttendance = useCallback(
     async (tipo: 'entrada' | 'salida', photoBlob: Blob): Promise<MarkAttendanceResult> => {
@@ -300,11 +327,15 @@ export function useAttendance() {
         const now = new Date();
         const recordId = safeUUID();
 
-        // ✅ Geo: resuélvelo ANTES del insert, para poder guardarlo
+        // ✅ Geo (solo online)
         let geo: GeoResult = null;
-        if (tipo === 'entrada' && isOnline && location?.latitude != null && location?.longitude != null) {
-          geo = await resolveGeo(location.latitude, location.longitude);
+        const hasCoords = location?.latitude != null && location?.longitude != null;
+        if (isOnline && hasCoords) {
+          geo = await resolveGeo(location!.latitude, location!.longitude);
         }
+
+        // ✅ fuera_zona: si hay coords y no hubo match
+        const fueraZona = hasCoords ? !geo : false;
 
         const record: PendingRecord = {
           id: recordId,
@@ -315,21 +346,18 @@ export function useAttendance() {
           latitud: location?.latitude ?? null,
           longitud: location?.longitude ?? null,
           precision_gps: location?.accuracy ?? null,
-          fuera_zona: false,
+          fuera_zona: fueraZona,
           foto_blob: photoBlob,
           foto_url: null,
           es_inconsistente: isInconsistent,
           nota_inconsistencia: note,
           created_at: now.toISOString(),
 
-          // ✅ si tu PendingRecord/IndexedDB aún no tiene estos campos, no pasa nada;
-          // pero ideal que los agregues para offline completo.
-          ...(tipo === 'entrada'
-            ? ({
-                hac_ste: geo?.hac_ste ?? null,
-                suerte_nom: geo?.nom ?? null,
-              } as any)
-            : {}),
+          // ✅ guardamos ubicación también en pending (si tu schema offline lo soporta)
+          ...( {
+            hac_ste: geo?.hac_ste ?? null,
+            suerte_nom: geo?.nom ?? null,
+          } as any),
         };
 
         if (isOnline) {
@@ -350,13 +378,11 @@ export function useAttendance() {
             estado_sync: 'sincronizado',
             es_inconsistente: record.es_inconsistente,
             nota_inconsistencia: record.nota_inconsistencia,
-          };
 
-          // ✅ guarda ubicación en BD (solo para entrada)
-          if (tipo === 'entrada') {
-            payload.hac_ste = geo?.hac_ste ?? null;
-            payload.suerte_nom = geo?.nom ?? null;
-          }
+            // ✅ ubicación siempre
+            hac_ste: geo?.hac_ste ?? null,
+            suerte_nom: geo?.nom ?? null,
+          };
 
           const { error: insertError } = await supabase.from('registros_asistencia').insert(payload);
           if (insertError) throw new Error(`DB insert failed: ${insertError.message}`);
@@ -367,7 +393,7 @@ export function useAttendance() {
         await getTodayRecords();
 
         let hoursWorked: number | null = null;
-        if (tipo === 'salida') hoursWorked = calculateHoursWorked();
+        if (tipo === 'salida') hoursWorked = calculateHoursWorked(); // suma por parejas
 
         setState((prev) => ({ ...prev, isSubmitting: false, error: null }));
 
@@ -421,7 +447,6 @@ export function useAttendance() {
           const b64 = await blobToBase64(photoBlob);
           const pending = readPendingFollowups();
 
-          // evita duplicados por (user, entrada, evidencia_n)
           const filtered = pending.filter(
             (p) => !(p.user_id === user.id && p.entrada_id === entradaId && p.evidencia_n === evidenciaN)
           );
@@ -520,6 +545,11 @@ export function useAttendance() {
     writePendingFollowups([...keepOthers, ...keepMine]);
     return { synced, failed };
   }, [user, isOnline, uploadPhoto]);
+
+  // ✅ opcional: refresca registros cuando cambia online/offline
+  useEffect(() => {
+    if (user) getTodayRecords();
+  }, [user, isOnline, getTodayRecords]);
 
   return {
     ...state,

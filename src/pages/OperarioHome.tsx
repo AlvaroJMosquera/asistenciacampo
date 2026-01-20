@@ -126,7 +126,7 @@ export default function OperarioHome() {
   }, [syncPendingFollowups, getTodayRecords]);
 
   const today = format(new Date(), "EEEE, d 'de' MMMM", { locale: es });
-  const hoursWorked = calculateHoursWorked();
+  const hoursWorked = calculateHoursWorked({ includeOpenSession: false });
 
   const closeModal = () => setModalState((prev) => ({ ...prev, isOpen: false }));
 

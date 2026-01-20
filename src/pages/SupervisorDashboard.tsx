@@ -105,37 +105,48 @@ export default function SupervisorDashboard() {
 
   // ---------------------- STATS NUEVAS ----------------------
   const stats = useMemo(() => {
-    const totalActivosPerfil = users.length;
+  const totalActivosPerfil = users.length;
 
-    const entradasUsers = new Set(records.filter((r) => r.tipo_registro === 'entrada').map((r) => r.user_id));
-    const salidasUsers = new Set(records.filter((r) => r.tipo_registro === 'salida').map((r) => r.user_id));
+  // total personas con algún registro (únicos)
+  const totalPersonas = new Set(records.map((r) => r.user_id)).size;
 
-    // total personas con algún registro (únicos)
-    const totalPersonas = new Set(records.map((r) => r.user_id)).size;
+  // inconsistentes por usuario único
+  const inconsistentesUnicos = new Set(records.filter((r) => r.es_inconsistente).map((r) => r.user_id)).size;
 
-    // inconsistentes por usuario único
-    const inconsistentesUnicos = new Set(records.filter((r) => r.es_inconsistente).map((r) => r.user_id)).size;
+  // usuarios con entrada / salida (solo presencia, no estado final)
+  const entradasUnicas = new Set(records.filter((r) => r.tipo_registro === 'entrada').map((r) => r.user_id));
+  const salidasUnicas = new Set(records.filter((r) => r.tipo_registro === 'salida').map((r) => r.user_id));
 
-    // ✅ Requerimiento 2: Activos x día (marcan entrada sin salida)
-    // usuario con entrada y sin salida
-    const activosSinSalida = new Set(
-      Array.from(entradasUsers).filter((uid) => !salidasUsers.has(uid))
-    ).size;
+  // ✅ Activos sin salida (estado final): último evento del usuario = "entrada"
+  const lastEventByUser = new Map<string, AttendanceRecord>();
 
-    // ✅ Requerimiento 3: Inactivos x día (no registran entrada)
-    // = usuarios activos en profiles - usuarios con entrada
-    const inactivos = Math.max(0, totalActivosPerfil - entradasUsers.size);
+  // aseguramos orden ascendente para que el último sobreescriba bien
+  const ordered = [...records].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
 
-    return {
-      totalPersonas,
-      entradas: entradasUsers.size,
-      salidas: salidasUsers.size,
-      inconsistentes: inconsistentesUnicos,
-      activosSinSalida,
-      inactivos,
-      totalActivosPerfil,
-    };
-  }, [records, users]);
+  for (const r of ordered) {
+    lastEventByUser.set(r.user_id, r);
+  }
+
+  const activosSinSalida = Array.from(lastEventByUser.values()).filter(
+    (r) => r.tipo_registro === 'entrada'
+  ).length;
+
+  // ✅ Inactivos (sin entrada): profiles activos - usuarios que marcaron al menos 1 entrada
+  const inactivos = Math.max(0, totalActivosPerfil - entradasUnicas.size);
+
+  return {
+    totalPersonas,
+    entradas: entradasUnicas.size,
+    salidas: salidasUnicas.size,
+    inconsistentes: inconsistentesUnicos,
+    activosSinSalida,
+    inactivos,
+    totalActivosPerfil,
+  };
+}, [records, users]);
+
   // ---------------------------------------------------------
 
   // ✅ CSV con columna Ubicación (Hacienda-Suerte)
