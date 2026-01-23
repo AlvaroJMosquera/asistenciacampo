@@ -217,7 +217,9 @@ export default function SupervisorDashboard() {
               </div>
             </CardContent>
           </Card>
-
+        <Link to="/supervisor/tracking">
+          <Button variant="outline" size="sm">Mapa</Button>
+        </Link>
           <Card>
             <CardContent className="p-4 flex items-center gap-3">
               <LogIn className="h-8 w-8 text-success" />

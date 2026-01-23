@@ -13,7 +13,8 @@ import { ConfirmationModal } from '@/components/ConfirmationModal';
 import { Button } from '@/components/ui/button';
 import { Link } from 'react-router-dom';
 import { useCamera } from '@/hooks/useCamera';
-
+import { useLocationTracking } from '@/hooks/useLocationTracking';
+import { useLocationTrack } from '@/hooks/useLocationTrack';
 import {
   Dialog,
   DialogContent,
@@ -24,6 +25,8 @@ import {
 } from '@/components/ui/dialog';
 
 type FollowUpRow = { evidencia_n: 1 | 2; foto_url: string; timestamp: string };
+
+
 
 // ✅ pruebas: 1 minuto (cambia a 3*60*60*1000 en prod)
 const FOLLOWUP_REQUIRED_MS = 1 * 60 * 1000;
@@ -338,7 +341,8 @@ export default function OperarioHome() {
       showError('entrada', msg);
     }
   };
-
+  const activeEntradaId = activeEntrada?.id ?? null;
+  useLocationTracking(activeEntradaId);
   return (
     <div className="min-h-screen flex flex-col bg-background">
       <header className="sticky top-0 z-10 bg-card border-b px-4 py-3 shadow-sm">
